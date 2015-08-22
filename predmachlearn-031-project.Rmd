@@ -1,0 +1,212 @@
+---
+title: "Machine Learning Course Project"
+author: "Nick Lusk"
+date: "August 22, 2015"
+output: html_document
+---
+
+#Background
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset). 
+
+#Data Loading and Preprocessing
+
+The training data are available here:
+
+[pml_training.csv](http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv)
+
+The test data are available here: 
+
+[pml_testing.csv](http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)
+
+The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har. If you use the document you create for this class for any purpose please cite them as they have been very generous in allowing their data to be used for this kind of assignment. 
+
+#What you should submit
+The goal of your project is to predict the manner in which they did the exercise. This is the "classe" variable in the training set. You may use any of the other variables to predict with. You should create a report describing how you built your model, how you used cross validation, what you think the expected out of sample error is, and why you made the choices you did. You will also use your prediction model to predict 20 different test cases. 
+
+1. Your submission should consist of a link to a Github repo with your R markdown and compiled HTML file describing your analysis. Please constrain the text of the writeup to < 2000 words and the number of figures to be less than 5. It will make it easier for the graders if you submit a repo with a gh-pages branch so the HTML page can be viewed online (and you always want to make it easy on graders :-).
+2. You should also apply your machine learning algorithm to the 20 test cases available in the test data above. Please submit your predictions in appropriate format to the programming assignment for automated grading. See the programming assignment for additional details. 
+
+Load the required libraries, if any package is missing use install.packages("") to acquire it. Note that for this project I have used the, at the time, current version of R which is 3.2.2. You will get warnings from some packages if using a previous version, however your results may not be impacted.
+
+```{r, echo=TRUE, message=FALSE}
+# load packages
+library(lattice)
+library(ggplot2)
+library(caret)
+library(randomForest)
+library(rpart) 
+library(rpart.plot)
+library(kernlab)
+library(foreach)
+library(iterators)
+library(parallel)
+library(doParallel)
+library(nnet)
+library(e1071)
+library(MASS)
+library(Matrix)
+library(lme4)
+library(arm)
+library(survival)
+library(splines)
+library(gbm)
+library(plyr)
+library(klaR)
+library(ipred)
+```
+
+If possible, take advantage of parallel processing by using multiple cores.
+
+```{r}
+# detect cores and set for parallel processing
+myCores <- detectCores()
+registerDoParallel(myCores)
+```
+
+To insure reproducability set a seed.
+
+```{r}
+# set a seed
+set.seed(30316)
+```
+
+Download the files, if not already done, load them into memory.  Preprocessing will also be done at this stage by removing useless values such as NA and by removing the first six columns of data which contain only meta data irrelevant to our calculations.
+
+```{r}
+# download the files
+if (!file.exists("pml-training.csv")){
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", destfile = "pml-training.csv")  
+}
+if (!file.exists("pml-testing.csv")){
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", destfile = "pml-testing.csv")  
+}
+
+# remove useless values
+training <- read.csv("pml-training.csv", na.strings = c("", "#DIV/0!", "NA"), stringsAsFactors = FALSE)
+testing <- read.csv("pml-testing.csv", na.strings = c("", "#DIV/0!", "NA"), stringsAsFactors = FALSE)
+
+# function to clean out junk data
+clean_data = function(x){
+  # remove first six columns of unrelated data
+  cleaner <- x[, -(1:6)]
+  # find and remove additional columns with junk data
+  naThreshold = as.integer(nrow(x) * 0.5)
+  cleaner <- subset(cleaner, select = -which(colSums(is.na(cleaner)) > naThreshold))
+  cleaner
+}
+training_clean = clean_data(training)
+testing_clean = clean_data(testing)
+```
+
+#Partitioning and Train Control
+
+Before executing a series of train functions the data needs to be partitioned, I am going with a 7 to 3 ratio.  Addionally, the "classe" variable is set as a factor, and an empty numeric vector is created for use in calculating the out of sample error. The final part of this step is creating the train control.  The train control will use the cross validation method, 12 folds or iterations, it will not save the data or return how much of the sampling data should be saved, nor save the hold-out predictions of each sample, no training log will be printed, preprocessing will be set to "principle component analysis" and we will attempt to take advantage of parallel processing.
+
+```{r}
+# partition the data
+training_dp <- createDataPartition(training_clean$classe, p = 0.7, list = FALSE)
+training_partition <- training_clean[training_dp, ]
+testing_partition <- training_clean[-training_dp, ]
+
+# set classe as factor
+training_partition$classe <- as.factor(training_partition$classe)
+testing_partition$classe <- as.factor(testing_partition$classe)
+
+# create an empty numeric vector to calculate out of sample error against
+outOfSampleError <- numeric()
+
+# add some parameters for train control
+TC <- trainControl(method = "cv", number = 12, returnData=FALSE, returnResamp="none", savePredictions=FALSE, verboseIter=FALSE , preProcOptions="pca", allowParallel=TRUE)
+```
+
+#Build Models
+
+Now it is time to train the data.  In order to get a wide range of results we will be using several types: bayesglm (Bayesian GLM), gbm (Generalized Boosted Regression), knn (K Nearest Neighbor), nb (Naive Bayes), nnet (Neural Net), rf (Random Forest), rpart (Recursive Partitioning and Regression Trees), svmLinear (Support Vector Machines Linear), svmRadial (Support Vector Machines Radial), and treebag (Bagged Classification and Regression Trees). Once each of the train methods finishes we will follow it with a prediction and accuracy function. Finally, before moving to the next train function we will calculate the out of sample error for that training method.
+
+```{r}
+# train, predict, calculate accuracy and out of sample error
+bayesglm <- train(classe ~ ., method="bayesglm", data=training_partition, trControl= TC)
+bayesglmPrediction <- predict(bayesglm, testing_partition)
+bayesglmAccuracy <- sum(bayesglmPrediction == testing_partition$classe) / length(bayesglmPrediction)
+bayesglmOutOfSampleError <- c(outOfSampleError, 1-bayesglmAccuracy)
+
+gbm <- train(classe ~ ., method="gbm", data=training_partition, trControl= TC)
+gbmPrediction <- predict(gbm, testing_partition)
+gbmAccuracy <- sum(gbmPrediction == testing_partition$classe) / length(gbmPrediction)
+gbmOutOfSampleError <- c(outOfSampleError, 1-gbmAccuracy)
+
+knn <- train(classe ~ ., method="knn", data=training_partition, trControl= TC)
+knnPrediction <- predict(knn, testing_partition)
+knnAccuracy <- sum(knnPrediction == testing_partition$classe) / length(knnPrediction)
+knnOutOfSampleError <- c(outOfSampleError, 1-knnAccuracy)
+
+nb <- train(classe ~ ., method="nb", data=training_partition, trControl= TC)
+nbPrediction <- predict(nb, testing_partition)
+nbAccuracy <- sum(nbPrediction == testing_partition$classe) / length(nbPrediction)
+nbOutOfSampleError <- c(outOfSampleError, 1-nbAccuracy)
+
+nnet <- train(classe ~ ., method="nnet", data=training_partition, trControl= TC)
+nnetPrediction <- predict(nnet, testing_partition)
+nnetAccuracy <- sum(nnetPrediction == testing_partition$classe) / length(nnetPrediction)
+nnetOutOfSampleError <- c(outOfSampleError, 1-nnetAccuracy)
+
+rf <- train(classe ~ ., method="rf", data=training_partition, trControl= TC)
+rfPrediction <- predict(rf, testing_partition)
+rfAccuracy <- sum(rfPrediction == testing_partition$classe) / length(rfPrediction)
+rfOutOfSampleError <- c(outOfSampleError, 1-rfAccuracy)
+
+rpart <- train(classe ~ ., method="rpart", data=training_partition, trControl= TC)
+rpartPrediction <- predict(rpart, testing_partition)
+rpartAccuracy <- sum(rpartPrediction == testing_partition$classe) / length(rpartPrediction)
+rpartOutOfSampleError <- c(outOfSampleError, 1-rpartAccuracy)
+
+svml <- train(classe ~ ., method="svmLinear", data=training_partition, trControl= TC)
+svmlPrediction <- predict(svml, testing_partition)
+svmlAccuracy <- sum(svmlPrediction == testing_partition$classe) / length(svmlPrediction)
+svmlOutOfSampleError <- c(outOfSampleError, 1-svmlAccuracy)
+
+svmr <- train(classe ~ ., method="svmRadial", data=training_partition, trControl= TC)
+svmrPrediction <- predict(svmr, testing_partition)
+svmrAccuracy <- sum(svmrPrediction == testing_partition$classe) / length(svmrPrediction)
+svmrOutOfSampleError <- c(outOfSampleError, 1-svmrAccuracy)
+
+treebag <- train(classe ~ ., method="treebag", data=training_partition, trControl= TC)
+treebagPrediction <- predict(treebag, testing_partition)
+treebagAccuracy <- sum(treebagPrediction == testing_partition$classe) / length(treebagPrediction)
+treebagOutOfSampleError <- c(outOfSampleError, 1-treebagAccuracy)
+```
+
+#Results
+
+Now all the values can be displayed in a table, ranked by accuracy.
+
+```{r}
+trainMethods <- c("Bayesian GLM", "Generalized Boosted Regression", "K Nearest Neighbor", "Naive Bayes", "Neural Net", "Random Forest", "Recursive Partitioning and Regression Trees", "Support Vector Machines Linear", "Support Vector Machines Radial", "Bagged Classification and Regression Trees")
+accuracy <- c(bayesglmAccuracy, gbmAccuracy, knnAccuracy, nbAccuracy, nnetAccuracy, rfAccuracy, rpartAccuracy, svmlAccuracy, svmrAccuracy, treebagAccuracy)
+outOfSampleError <- c(bayesglmOutOfSampleError, gbmOutOfSampleError, knnOutOfSampleError, nbOutOfSampleError, nnetOutOfSampleError, rfOutOfSampleError, rpartOutOfSampleError, svmlOutOfSampleError, svmrOutOfSampleError, treebagOutOfSampleError)
+
+results <- data.frame(trainMethods, accuracy, outOfSampleError)
+results[order(results$accuracy),]
+```
+
+#Cross-validation
+
+Cross-validate the top result, Random Forest, before moving on to final calculation.
+
+```{r}
+predictCrossVal <- predict(rf, testing_partition)
+confusionMatrix(testing_partition$classe, predictCrossVal)
+```
+
+#Test Data Predictions
+
+Random Forest comes out on top with the highest accuracy, the lowest out of sample error and a 99% prediction accuracy via cross-validation. Using Random Forest as our method we can now execute the predict function against our test data set.
+
+```{r}
+testingPrediction <- predict(rf, testing)
+print(testingPrediction)
+```
+
+#Conclusion
+
+While Bagged Classification and Regression Trees, and perhaps Generalized Boosted Regression, would have also given us accurate predictions using this dataset, Random Forest tested with the highest overall accuracy. Using a variety of models it is possible to identify a training model that will accurately predict how well a person is performing a particular exercise using the information collected by Human Activity Recognition devices.
